@@ -259,7 +259,13 @@ async function callProvider(candidate: Candidate, clientWire: 'openai' | 'anthro
   if (provider.wire === 'openai') {
     url = `${base}/v1/chat/completions`;
     upstreamBody = clientWire === 'openai' ? { ...body, model: candidate.model.id } : anthropicToOpenAI(body, candidate.model.id);
-    if (stream) headers.accept = 'text/event-stream';
+    // A streamed answer must carry its usage (the wire check reads it), and the provider only
+    // sends the usage chunk when stream_options.include_usage is set — the client's body may not
+    // set it, so set it here. It is not an echo field, so the echo is unaffected.
+    if (stream) {
+      headers.accept = 'text/event-stream';
+      upstreamBody = { ...upstreamBody, stream_options: { include_usage: true } };
+    }
   } else if (provider.wire === 'anthropic') {
     url = `${base}/v1/messages`;
     headers['anthropic-version'] = '2023-06-01';
