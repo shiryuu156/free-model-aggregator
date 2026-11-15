@@ -102,6 +102,13 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Provider calls made so far (successful and refused): the load-spreading tie-break. */
 const providerCalls = new Map<string, number>();
+/**
+ * Consecutive refusals per provider, reset to 0 on a success. A provider that refuses twice in a
+ * row is likely out of budget (a scheduled failure is a one-off; two in a row means the budget is
+ * spent or an outage began), so its candidates sort after providers that have not just refused.
+ * It is a deprioritisation, not a blacklist: it is still tried when nothing better answers.
+ */
+const consecutiveFailures = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -140,7 +147,8 @@ interface Candidate {
 }
 
 /**
- * Every free model meeting the requirements, ranked best first: rating descending, then the
+ * Every free model meeting the requirements, ranked best first: a provider that just refused twice
+ * in a row sorts after one that has not (likely out of budget), then rating descending, then the
  * provider's call count so far (ascending, to spread load across providers), then provider and
  * model id for a deterministic order. When `jsonMode` is true (an OpenAI client sent
  * response_format), anthropic-wire providers are excluded: their wire cannot carry JSON mode.
@@ -157,7 +165,11 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
       out.push({ probe, model, row, rating: row?.rating_milli ?? 0 });
     }
   }
+  const suspect = (id: string): number => ((consecutiveFailures.get(id) ?? 0) >= 2 ? 1 : 0);
   out.sort((a, b) => {
+    const suspectA = suspect(a.probe.provider.id);
+    const suspectB = suspect(b.probe.provider.id);
+    if (suspectA !== suspectB) return suspectA - suspectB;
     if (b.rating !== a.rating) return b.rating - a.rating;
     const callsA = providerCalls.get(a.probe.provider.id) ?? 0;
     const callsB = providerCalls.get(b.probe.provider.id) ?? 0;
@@ -316,9 +328,14 @@ async function tryCandidates(
       result = await callProvider(candidate, clientWire, body, stream);
     } catch (err) {
       log(`call to ${key} failed: ${(err as Error).message}`);
+      consecutiveFailures.set(candidate.probe.provider.id, (consecutiveFailures.get(candidate.probe.provider.id) ?? 0) + 1);
       continue;
     }
-    if (result.status >= 200 && result.status < 300) return { candidate, result };
+    if (result.status >= 200 && result.status < 300) {
+      consecutiveFailures.set(candidate.probe.provider.id, 0);
+      return { candidate, result };
+    }
+    consecutiveFailures.set(candidate.probe.provider.id, (consecutiveFailures.get(candidate.probe.provider.id) ?? 0) + 1);
     if (isRefusal(result.status)) {
       log(`${key} refused with HTTP ${result.status}, failing over`);
       continue;
