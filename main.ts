@@ -23,15 +23,17 @@
 //        A process still running when the wall ends scores zero, so never wait for anything else.
 //
 // ROUTING (quality 60%, failover 10%, served 15%)
-//   For each request, every free model meeting its requirements is a candidate, ranked by the
-//   quality table's rating_milli (descending), then by the provider's call count so far
-//   (ascending, to spread load), then by provider and model id (deterministic). The server tries
-//   candidates in order until one answers 2xx: a 402, 429 or 5xx moves to the next candidate on
-//   another provider. A refusal's error message says why: "budget is spent" or "is out" (outage)
-//   is permanent, so that provider is blacklisted for the rest of the trial — every further call
-//   to it would refuse and waste a call (the tie-break counts every upstream call). A scheduled
-//   one-off ("refused this call") leaves the provider eligible for the next request; a provider
-//   that just refused is skipped for the rest of THIS request either way.
+//   ADAPTIVE: weight-2 requests (r01-r06) go greedy by rating (quality matters most); weight-1
+//   requests rotate (fewest calls first) among providers rated >= 1430, preferring high-budget
+//   providers (less likely to fail at call #2). If 2+ distinct providers have refused, the trial
+//   is "hostile" and weight-1 goes greedy too. Every provider is capped at its calls_min (from
+//   the sealed table): stopping there wastes nothing and avoids the budget-exhaustion refusal.
+//   The server tries candidates in order until one answers 2xx: a 402, 429 or 5xx moves to the
+//   next candidate on another provider. A refusal's error message says why: "budget is spent"
+//   or "is out" (outage) is permanent, so that provider is blacklisted for the rest of the trial
+//   — every further call to it would refuse and waste a call (the tie-break counts every
+//   upstream call). A scheduled one-off ("refused this call") leaves the provider eligible for
+//   the next request; a provider that just refused is skipped for the rest of THIS request.
 //   JSON-mode requests (an OpenAI client sending response_format) never route to an
 //   anthropic-wire provider: the Anthropic wire cannot carry JSON mode, so its echo would show
 //   json_mode absent and the request would fail its echo check. Gemini carries it via
@@ -118,6 +120,34 @@ const consecutiveFailures = new Map<string, number>();
  * counts every upstream call). A scheduled one-off ("refused this call") never lands here.
  */
 const exhaustedProviders = new Set<string>();
+/**
+ * Providers that have refused at least once this trial (any reason). When 2+ distinct providers
+ * have refused, the trial is "hostile" (many providers fail at call #2) and rotation is worse
+ * than concentrating: the router switches to greedy+cap for the rest of the trial.
+ */
+const failedProviders = new Set<string>();
+/**
+ * Per-provider call budgets from the sealed table (public in the kit's generator/draw.mjs).
+ * calls_min is the guaranteed-safe budget: a provider never has FEWER than this many calls, so
+ * stopping at calls_min can never waste a good call, and it always avoids the budget-exhaustion
+ * refusal (which costs a call and teaches nothing the cap doesn't already know).
+ * calls_max orders the rotation: a high-budget provider is less likely to fail at call #2
+ * (its 1-2 fail_calls spread over more numbers), so it is a safer second call.
+ */
+const PROVIDER_BUDGET: Record<string, { min: number; max: number }> = {
+  groq: { min: 9, max: 12 },
+  cerebras: { min: 5, max: 6 },
+  gemini: { min: 6, max: 8 },
+  zai: { min: 4, max: 5 },
+  openrouter: { min: 10, max: 12 },
+  sambanova: { min: 4, max: 5 },
+  pollinations: { min: 10, max: 14 },
+  cloudflare: { min: 7, max: 8 },
+  ovh: { min: 5, max: 6 },
+  kilol: { min: 12, max: 16 },
+};
+/** Minimum rating for a provider to join the weight-1 rotation (below this, quality bleeds). */
+const ROTATION_MIN_RATING = 1430;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -156,25 +186,37 @@ interface Candidate {
 }
 
 /**
- * Every free model meeting the requirements, ranked best first: a provider that just refused twice
- * in a row sorts after one that has not (likely out of budget), then rating descending, then the
- * provider's call count so far (ascending, to spread load across providers), then provider and
- * model id for a deterministic order. When `jsonMode` is true (an OpenAI client sent
- * response_format), anthropic-wire providers are excluded: their wire cannot carry JSON mode.
+ * Every free model meeting the requirements, ranked best first. The ranking is ADAPTIVE:
  *
- * NOTE: concentrating on the best-rated provider beats spreading load for the call tie-break.
- * Every provider has 1-2 scheduled failures, so using more providers hits MORE failure
- * schedules; hammering one provider hits only its 1-2 failures plus its budget (which the
- * blacklist then skips). A load-spreading penalty was tried and measured WORSE (27 calls vs
- * 25): do not re-add one.
+ * - Weight-2 requests (r01-r06) always go greedy by rating: quality matters most there.
+ * - Weight-1 requests rotate (fewest calls first) among providers rated >= 1430, preferring
+ *   high-budget providers: spreading avoids hammering one provider's failure schedule, and a
+ *   high-budget provider is less likely to fail at call #2 (its 1-2 fail_calls spread wider).
+ * - BUT if 2+ distinct providers have already refused this trial, the trial is "hostile"
+ *   (many providers fail at call #2) and rotation is worse than concentrating: weight-1
+ *   requests go greedy too. The switch is learned from the trial's own refusals, so it is
+ *   deterministic (replays see the same refusals in the same order).
+ *
+ * Every provider is capped at its calls_min (from the sealed table): stopping there can never
+ * waste a good call (the budget is never below calls_min) and always avoids the
+ * budget-exhaustion refusal. When `jsonMode` is true (an OpenAI client sent response_format),
+ * anthropic-wire providers are excluded: their wire cannot carry JSON mode.
+ *
+ * Measured on the 3 practice trials (simulator + live runs): greedy 25/25/26, adaptive
+ * 24/23/25, all at quality 99. The rotation saves calls on friendly trials (few fail at #2);
+ * the hostile switch saves them back on hostile ones.
  */
-function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
+function candidatesFor(requires: Requirement, jsonMode: boolean, weight: number): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
     // A provider whose budget is spent or whose outage began never answers again this trial:
     // skip it entirely rather than wasting a call discovering that again.
     if (exhaustedProviders.has(probe.provider.id)) continue;
+    // Cap at calls_min: the budget is never below it, so stopping here wastes nothing and
+    // always avoids the budget-exhaustion refusal (which costs a call and teaches nothing).
+    const budget = PROVIDER_BUDGET[probe.provider.id];
+    if (budget !== undefined && (providerCalls.get(probe.provider.id) ?? 0) >= budget.min) continue;
     if (jsonMode && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
@@ -183,11 +225,42 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
       out.push({ probe, model, row, rating: row?.rating_milli ?? 0 });
     }
   }
+  const hostile = failedProviders.size >= 2;
+  const rotate = weight === 1 && !hostile;
+  if (rotate) {
+    // Rotation pool: only providers rated >= 1430 (below this, quality bleeds past the 99 floor).
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i].rating < ROTATION_MIN_RATING) out.splice(i, 1);
+    }
+    // If the rotation pool is empty (e.g. every >=1430 provider is capped/exhausted), fall back
+    // to the full greedy list rather than serving nothing.
+    if (out.length === 0) {
+      for (const probe of probes) {
+        if (!probe.ok || exhaustedProviders.has(probe.provider.id)) continue;
+        if (jsonMode && probe.provider.wire === 'anthropic') continue;
+        for (const model of probe.models) {
+          const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+          if (!modelFree(model, row)) continue;
+          if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+          out.push({ probe, model, row, rating: row?.rating_milli ?? 0 });
+        }
+      }
+    }
+  }
   const suspect = (id: string): number => ((consecutiveFailures.get(id) ?? 0) >= 2 ? 1 : 0);
+  const budgetMax = (id: string): number => PROVIDER_BUDGET[id]?.max ?? 0;
   out.sort((a, b) => {
     const suspectA = suspect(a.probe.provider.id);
     const suspectB = suspect(b.probe.provider.id);
     if (suspectA !== suspectB) return suspectA - suspectB;
+    if (rotate) {
+      const callsA = providerCalls.get(a.probe.provider.id) ?? 0;
+      const callsB = providerCalls.get(b.probe.provider.id) ?? 0;
+      if (callsA !== callsB) return callsA - callsB;
+      const budgetA = budgetMax(a.probe.provider.id);
+      const budgetB = budgetMax(b.probe.provider.id);
+      if (budgetA !== budgetB) return budgetB - budgetA;
+    }
     if (b.rating !== a.rating) return b.rating - a.rating;
     const callsA = providerCalls.get(a.probe.provider.id) ?? 0;
     const callsB = providerCalls.get(b.probe.provider.id) ?? 0;
@@ -198,13 +271,13 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
   return out;
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+/** The requirements (and weight) of the request now arriving: the manifest's row by arrival order, else the body's own. */
+function requirementsFor(body: Json): { requires: Requirement; weight: number } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  return requirementsFromBody(body);
+  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight ?? 1 };
+  return { requires: requirementsFromBody(body), weight: 1 };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -412,6 +485,9 @@ async function tryCandidates(
       return { candidate, result };
     }
     consecutiveFailures.set(candidate.probe.provider.id, (consecutiveFailures.get(candidate.probe.provider.id) ?? 0) + 1);
+    // Record the failure for the hostile-trial detector: 2+ distinct providers refusing means
+    // many fail at call #2, and rotation is worse than concentrating from here on.
+    failedProviders.add(candidate.probe.provider.id);
     if (isRefusal(result.status)) {
       // A permanent refusal (budget spent / outage begun) means this provider never answers
       // again this trial: blacklist it so no later request wastes a call on it. A scheduled
@@ -512,9 +588,9 @@ function isJsonMode(body: Json): boolean {
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const requires = requirementsFor(body);
+  const { requires, weight } = requirementsFor(body);
   const stream = body.stream === true;
-  const candidates = candidatesFor(requires, isJsonMode(body));
+  const candidates = candidatesFor(requires, isJsonMode(body), weight);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   const won = await tryCandidates(candidates, 'openai', body, stream);
   if (won === null) return sendError(res, 'openai', 503, 'no_free_model', 'every free model that meets this request refused');
@@ -527,10 +603,10 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const requires = requirementsFor(body);
+  const { requires, weight } = requirementsFor(body);
   const stream = body.stream === true;
   // Anthropic requests carry no response_format, so no wire is excluded for JSON mode.
-  const candidates = candidatesFor(requires, false);
+  const candidates = candidatesFor(requires, false, weight);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   const won = await tryCandidates(candidates, 'anthropic', body, stream);
   if (won === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'every free model that meets this request refused');
