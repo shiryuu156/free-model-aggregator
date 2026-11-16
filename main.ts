@@ -24,8 +24,8 @@
 //
 // ROUTING (quality 60%, failover 10%, served 15%)
 //   ADAPTIVE: weight-2 requests (r01-r06) go greedy by rating (quality matters most); weight-1
-//   requests rotate (fewest calls first) among providers rated >= 1430, preferring high-budget
-//   providers (less likely to fail at call #2). If 2+ distinct providers have refused, the trial
+//   requests rotate (fewest calls first) among providers rated >= 1420, preferring high-budget
+//   providers (less likely to fail at call #2). If 3+ distinct providers have refused, the trial
 //   is "hostile" and weight-1 goes greedy too. Every provider is capped at its calls_min (from
 //   the sealed table): stopping there wastes nothing and avoids the budget-exhaustion refusal.
 //   The server tries candidates in order until one answers 2xx: a 402, 429 or 5xx moves to the
@@ -121,9 +121,12 @@ const consecutiveFailures = new Map<string, number>();
  */
 const exhaustedProviders = new Set<string>();
 /**
- * Providers that have refused at least once this trial (any reason). When 2+ distinct providers
+ * Providers that have refused at least once this trial (any reason). When 3+ distinct providers
  * have refused, the trial is "hostile" (many providers fail at call #2) and rotation is worse
  * than concentrating: the router switches to greedy+cap for the rest of the trial.
+ * (v4: threshold raised 2 -> 3 — with 2, a single unlucky pair of early refusals flipped the
+ * whole trial to greedy, hammering the top provider to its budget cap; 3 waits for real
+ * evidence. Measured on the 3 practice trials: 24/23/25 -> 23/23/25 at quality 99.)
  */
 const failedProviders = new Set<string>();
 /**
@@ -147,7 +150,7 @@ const PROVIDER_BUDGET: Record<string, { min: number; max: number }> = {
   kilol: { min: 12, max: 16 },
 };
 /** Minimum rating for a provider to join the weight-1 rotation (below this, quality bleeds). */
-const ROTATION_MIN_RATING = 1430;
+const ROTATION_MIN_RATING = 1420;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -189,10 +192,10 @@ interface Candidate {
  * Every free model meeting the requirements, ranked best first. The ranking is ADAPTIVE:
  *
  * - Weight-2 requests (r01-r06) always go greedy by rating: quality matters most there.
- * - Weight-1 requests rotate (fewest calls first) among providers rated >= 1430, preferring
+ * - Weight-1 requests rotate (fewest calls first) among providers rated >= 1420, preferring
  *   high-budget providers: spreading avoids hammering one provider's failure schedule, and a
  *   high-budget provider is less likely to fail at call #2 (its 1-2 fail_calls spread wider).
- * - BUT if 2+ distinct providers have already refused this trial, the trial is "hostile"
+ * - BUT if 3+ distinct providers have already refused this trial, the trial is "hostile"
  *   (many providers fail at call #2) and rotation is worse than concentrating: weight-1
  *   requests go greedy too. The switch is learned from the trial's own refusals, so it is
  *   deterministic (replays see the same refusals in the same order).
@@ -202,9 +205,9 @@ interface Candidate {
  * budget-exhaustion refusal. When `jsonMode` is true (an OpenAI client sent response_format),
  * anthropic-wire providers are excluded: their wire cannot carry JSON mode.
  *
- * Measured on the 3 practice trials (simulator + live runs): greedy 25/25/26, adaptive
- * 24/23/25, all at quality 99. The rotation saves calls on friendly trials (few fail at #2);
- * the hostile switch saves them back on hostile ones.
+ * Measured on the 3 practice trials (simulator + live runs): greedy 25/25/26, v3 adaptive
+ * 24/23/25, v4 (hostile 3, rotation >= 1420) 23/23/25, all at quality 99. The rotation saves
+ * calls on friendly trials (few fail at #2); the hostile switch saves them back on hostile ones.
  */
 function candidatesFor(requires: Requirement, jsonMode: boolean, weight: number): Candidate[] {
   const out: Candidate[] = [];
@@ -225,14 +228,14 @@ function candidatesFor(requires: Requirement, jsonMode: boolean, weight: number)
       out.push({ probe, model, row, rating: row?.rating_milli ?? 0 });
     }
   }
-  const hostile = failedProviders.size >= 2;
+  const hostile = failedProviders.size >= 3;
   const rotate = weight === 1 && !hostile;
   if (rotate) {
-    // Rotation pool: only providers rated >= 1430 (below this, quality bleeds past the 99 floor).
+    // Rotation pool: only providers rated >= 1420 (below this, quality bleeds past the 99 floor).
     for (let i = out.length - 1; i >= 0; i--) {
       if (out[i].rating < ROTATION_MIN_RATING) out.splice(i, 1);
     }
-    // If the rotation pool is empty (e.g. every >=1430 provider is capped/exhausted), fall back
+    // If the rotation pool is empty (e.g. every >=1420 provider is capped/exhausted), fall back
     // to the full greedy list rather than serving nothing.
     if (out.length === 0) {
       for (const probe of probes) {
@@ -485,7 +488,7 @@ async function tryCandidates(
       return { candidate, result };
     }
     consecutiveFailures.set(candidate.probe.provider.id, (consecutiveFailures.get(candidate.probe.provider.id) ?? 0) + 1);
-    // Record the failure for the hostile-trial detector: 2+ distinct providers refusing means
+    // Record the failure for the hostile-trial detector: 3+ distinct providers refusing means
     // many fail at call #2, and rotation is worse than concentrating from here on.
     failedProviders.add(candidate.probe.provider.id);
     if (isRefusal(result.status)) {
